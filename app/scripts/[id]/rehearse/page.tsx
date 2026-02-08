@@ -33,25 +33,39 @@ export default function RehearsePage() {
   const [userCharacter, setUserCharacter] = useState('');
   const [voiceMappings, setVoiceMappings] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
-  const [isPlaying, setIsPlaying] = useState(false);
+  
+  // Audio/WebRTC state
+  const [connectionState, setConnectionState] = useState<'idle' | 'connecting' | 'active' | 'error'>('idle');
+  const [isUserSpeaking, setIsUserSpeaking] = useState(false);
+  const [isAISpeaking, setIsAISpeaking] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const [silenceTimer, setSilenceTimer] = useState(0);
+  
+  // UI state
+  const [showDramaticPauseButton, setShowDramaticPauseButton] = useState(false);
+  const [autoAdvanceEnabled, setAutoAdvanceEnabled] = useState(true);
+  const [currentAIText, setCurrentAIText] = useState('');
 
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const audioElementRef = useRef<HTMLAudioElement | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
   const teleprompterRef = useRef<HTMLDivElement>(null);
   const currentLineRef = useRef<HTMLDivElement>(null);
+  const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Fetch script and session data
+  // Constants
+  const SILENCE_THRESHOLD = 1500; // 1.5 seconds of silence = user done speaking
+  const DRAMATIC_PAUSE_THRESHOLD = 5000; // 5 seconds = offer dramatic pause button
+
   useEffect(() => {
     fetchScript();
+    return () => cleanup();
   }, [scriptId]);
 
   useEffect(() => {
-    // Scroll to current line
     if (currentLineRef.current && teleprompterRef.current) {
-      currentLineRef.current.scrollIntoView({
-        behavior: 'smooth',
-        block: 'center',
-      });
+      currentLineRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   }, [currentIndex]);
 
@@ -63,7 +77,6 @@ export default function RehearsePage() {
       setScript(data.script);
       setElements(data.elements);
       
-      // Get session data
       if (sessionId) {
         const sessionRes = await fetch(`/api/sessions/${sessionId}`);
         if (sessionRes.ok) {
@@ -71,6 +84,9 @@ export default function RehearsePage() {
           setUserCharacter(sessionData.session.user_character);
           setVoiceMappings(sessionData.session.voice_mappings || {});
           setCurrentIndex(sessionData.session.current_line_index || 0);
+          
+          // Initialize WebRTC session
+          initializeRealtimeSession(sessionData.session.user_character);
         }
       }
     } catch (err) {
@@ -80,94 +96,281 @@ export default function RehearsePage() {
     }
   };
 
-  // Play AI voice for current line
-  const playCurrentLine = useCallback(async () => {
-    const currentElement = elements[currentIndex];
-    if (!currentElement || !currentElement.dialogue) return;
+  const cleanup = () => {
+    if (peerConnectionRef.current) {
+      peerConnectionRef.current.close();
+      peerConnectionRef.current = null;
+    }
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(track => track.stop());
+    }
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current);
+    }
+  };
 
-    // Don't play if it's the user's line
-    if (currentElement.character_name === userCharacter) return;
-
-    setIsPlaying(true);
-
+  const initializeRealtimeSession = async (userChar: string) => {
     try {
-      const voiceId = voiceMappings[currentElement.character_name || ''] || 
-                     '21m00Tcm4TlvDq8ikWAM'; // Default to Rachel
+      setConnectionState('connecting');
 
-      const response = await fetch('/api/voice', {
+      // Get ephemeral token from our API
+      const tokenRes = await fetch('/api/voice/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: currentElement.dialogue,
-          voiceId,
+        body: JSON.stringify({ 
+          scriptId, 
+          userCharacter: userChar 
         }),
       });
 
-      if (!response.ok) throw new Error('Failed to generate voice');
+      if (!tokenRes.ok) throw new Error('Failed to get session token');
+      const { sessionToken } = await tokenRes.json();
 
-      const audioBlob = await response.blob();
-      const audioUrl = URL.createObjectURL(audioBlob);
+      // Get script context
+      const contextRes = await fetch('/api/voice/script-context', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          scriptId, 
+          userCharacter: userChar,
+          currentLineIndex: 0 
+        }),
+      });
 
-      if (audioRef.current) {
-        audioRef.current.src = audioUrl;
-        audioRef.current.play();
+      const contextData = await contextRes.json();
+
+      // Setup WebRTC
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+      peerConnectionRef.current = pc;
+
+      // Get microphone
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+      // Audio output
+      const audioEl = document.createElement('audio');
+      audioEl.autoplay = true;
+      document.body.appendChild(audioEl);
+      audioElementRef.current = audioEl;
+
+      pc.ontrack = (e) => {
+        if (audioEl.srcObject !== e.streams[0]) {
+          audioEl.srcObject = e.streams[0];
+        }
+      };
+
+      // Data channel for events
+      const dc = pc.createDataChannel('oai-events');
+      dataChannelRef.current = dc;
+
+      dc.onopen = () => {
+        console.log('✅ Data channel open');
+        setConnectionState('active');
+        
+        // Send initial session config
+        dc.send(JSON.stringify({
+          type: 'session.update',
+          session: {
+            instructions: contextData.instructions,
+            modalities: ['audio', 'text'],
+            voice: 'alloy',
+            input_audio_transcription: { model: 'whisper-1' },
+            turn_detection: {
+              type: 'server_vad',
+              threshold: 0.5,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 2000, // 2 second silence = end of turn
+            }
+          }
+        }));
+
+        // Request response to start if AI speaks first
+        if (contextData.nextSpeaker?.type === 'ai') {
+          dc.send(JSON.stringify({
+            type: 'response.create'
+          }));
+        }
+      };
+
+      dc.onmessage = (e) => {
+        handleRealtimeEvent(JSON.parse(e.data));
+      };
+
+      // Create offer
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const response = await fetch(
+        'https://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
+        {
+          method: 'POST',
+          body: offer.sdp,
+          headers: {
+            'Authorization': `Bearer ${sessionToken}`,
+            'Content-Type': 'application/sdp'
+          }
+        }
+      );
+
+      if (!response.ok) throw new Error('Failed to connect to OpenAI');
+
+      const answerSdp = await response.text();
+      await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+
+    } catch (error) {
+      console.error('Session init error:', error);
+      setConnectionState('error');
+    }
+  };
+
+  const handleRealtimeEvent = useCallback((event: any) => {
+    console.log('Realtime event:', event.type);
+
+    switch (event.type) {
+      case 'input_audio_buffer.speech_started':
+        setIsUserSpeaking(true);
+        setShowDramaticPauseButton(false);
+        if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+        break;
+
+      case 'input_audio_buffer.speech_stopped':
+        setIsUserSpeaking(false);
+        // Start silence timer
+        let silenceCount = 0;
+        const checkSilence = () => {
+          silenceCount += 100;
+          setSilenceTimer(silenceCount);
+          
+          if (silenceCount >= DRAMATIC_PAUSE_THRESHOLD && !isAISpeaking) {
+            setShowDramaticPauseButton(true);
+          }
+          
+          if (silenceCount >= SILENCE_THRESHOLD && autoAdvanceEnabled && !isPaused) {
+            // User has been silent for 1.5s, advance to next line
+            advanceLine();
+          } else {
+            silenceTimeoutRef.current = setTimeout(checkSilence, 100);
+          }
+        };
+        silenceTimeoutRef.current = setTimeout(checkSilence, 100);
+        break;
+
+      case 'response.audio_transcript.delta':
+        setIsAISpeaking(true);
+        setShowDramaticPauseButton(false);
+        if (event.delta) {
+          setCurrentAIText(prev => prev + event.delta);
+        }
+        break;
+
+      case 'response.audio_transcript.done':
+        setIsAISpeaking(false);
+        setCurrentAIText('');
+        // AI finished speaking, advance after a brief pause
+        setTimeout(() => advanceLine(), 500);
+        break;
+
+      case 'response.done':
+        setIsAISpeaking(false);
+        break;
+
+      case 'error':
+        console.error('Realtime API error:', event.error);
+        break;
+    }
+  }, [autoAdvanceEnabled, isPaused, isAISpeaking]);
+
+  const advanceLine = useCallback(() => {
+    if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+    setShowDramaticPauseButton(false);
+    setSilenceTimer(0);
+    
+    setCurrentIndex(prev => {
+      const next = prev + 1;
+      if (next < elements.length) {
+        // Update context in Realtime API
+        updateContextWindow(next);
+        return next;
+      }
+      return prev;
+    });
+  }, [elements.length]);
+
+  const updateContextWindow = async (newIndex: number) => {
+    if (!dataChannelRef.current || dataChannelRef.current.readyState !== 'open') return;
+
+    try {
+      const contextRes = await fetch('/api/voice/script-context', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          scriptId,
+          userCharacter,
+          currentLineIndex: newIndex
+        }),
+      });
+
+      const contextData = await contextRes.json();
+
+      dataChannelRef.current.send(JSON.stringify({
+        type: 'session.update',
+        session: {
+          instructions: contextData.instructions,
+          turn_detection: {
+            type: 'server_vad',
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 2000
+          }
+        }
+      }));
+
+      // Trigger AI response if it's AI's turn
+      if (contextData.nextSpeaker?.type === 'ai') {
+        dataChannelRef.current.send(JSON.stringify({
+          type: 'response.create'
+        }));
       }
     } catch (err) {
-      console.error('Voice error:', err);
-    } finally {
-      setIsPlaying(false);
+      console.error('Failed to update context:', err);
     }
-  }, [currentIndex, elements, userCharacter, voiceMappings]);
+  };
 
-  // Advance to next line
-  const advanceLine = useCallback(() => {
-    if (currentIndex < elements.length - 1) {
-      setCurrentIndex(prev => prev + 1);
+  const handleDramaticPause = () => {
+    if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+    setShowDramaticPauseButton(false);
+    // Hold position, don't advance
+  };
+
+  const togglePause = () => {
+    setIsPaused(!isPaused);
+    if (!isPaused) {
+      // Resuming
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
     }
-  }, [currentIndex, elements.length]);
+  };
 
-  // Go back to previous line
-  const goBack = useCallback(() => {
+  const forceAdvance = () => {
+    advanceLine();
+  };
+
+  const goBack = () => {
     if (currentIndex > 0) {
-      setCurrentIndex(prev => prev - 1);
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+      setCurrentIndex(prev => {
+        const next = prev - 1;
+        updateContextWindow(next);
+        return next;
+      });
     }
-  }, [currentIndex]);
-
-  // Handle keyboard shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.code === 'Space') {
-        e.preventDefault();
-        advanceLine();
-      } else if (e.code === 'ArrowLeft') {
-        e.preventDefault();
-        goBack();
-      } else if (e.code === 'ArrowRight') {
-        e.preventDefault();
-        advanceLine();
-      } else if (e.code === 'KeyP') {
-        e.preventDefault();
-        setIsPaused(prev => !prev);
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [advanceLine, goBack]);
-
-  // Auto-play AI lines
-  useEffect(() => {
-    const currentElement = elements[currentIndex];
-    if (currentElement && 
-        currentElement.element_type === 'dialogue' && 
-        currentElement.character_name !== userCharacter) {
-      playCurrentLine();
-    }
-  }, [currentIndex, elements, playCurrentLine, userCharacter]);
+  };
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
+      <div className="min-h-screen flex items-center justify-center bg-gray-900 text-white">
         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
       </div>
     );
@@ -178,9 +381,6 @@ export default function RehearsePage() {
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
-      {/* Audio element for AI voices */}
-      <audio ref={audioRef} onEnded={() => setIsPlaying(false)} />
-
       {/* Header */}
       <header className="bg-gray-800 border-b border-gray-700 px-4 py-3">
         <div className="flex items-center justify-between">
@@ -191,7 +391,15 @@ export default function RehearsePage() {
               Scene {currentElement?.scene_number || 1}
             </p>
           </div>
-          <div className="flex items-center space-x-4">
+          <div className="flex items-center space-x-3">
+            <button
+              onClick={() => setAutoAdvanceEnabled(!autoAdvanceEnabled)}
+              className={`px-3 py-1 rounded text-sm ${
+                autoAdvanceEnabled ? 'bg-green-600' : 'bg-gray-600'
+              }`}
+            >
+              {autoAdvanceEnabled ? 'Auto ✓' : 'Manual'}
+            </button>
             <button
               onClick={() => window.location.href = '/dashboard'}
               className="text-gray-400 hover:text-white text-sm"
@@ -205,42 +413,38 @@ export default function RehearsePage() {
       {/* Main content */}
       <div className="flex h-[calc(100vh-64px)]">
         {/* Teleprompter */}
-        <div 
-          ref={teleprompterRef}
-          className="flex-1 overflow-y-auto p-6 space-y-2"
-        >
+        <div ref={teleprompterRef} className="flex-1 overflow-y-auto p-6 space-y-2">
           {elements.map((element, index) => {
             const isCurrent = index === currentIndex;
             const isPast = index < currentIndex;
-            const isFuture = index > currentIndex;
-
+            
             return (
               <div
                 key={element.id}
                 ref={isCurrent ? currentLineRef : null}
                 className={`p-4 rounded-lg transition-all duration-300 ${
                   isCurrent 
-                    ? 'bg-blue-600/20 border-2 border-blue-500' 
+                    ? 'bg-blue-600/30 border-2 border-blue-500 scale-100' 
                     : isPast 
-                      ? 'opacity-40' 
-                      : 'opacity-70'
+                      ? 'opacity-30' 
+                      : 'opacity-60'
                 }`}
               >
                 {element.element_type === 'scene_heading' && (
-                  <div className="text-yellow-400 font-semibold uppercase tracking-wide">
+                  <div className="text-yellow-400 font-semibold uppercase tracking-wide text-lg">
                     {element.content}
                   </div>
                 )}
 
                 {element.element_type === 'action' && (
-                  <div className="text-gray-300 italic">
+                  <div className="text-gray-400 italic">
                     {element.content}
                   </div>
                 )}
 
                 {element.element_type === 'character' && (
-                  <div className="text-center">
-                    <span className={`font-bold text-lg ${
+                  <div className="text-center my-4">
+                    <span className={`font-bold text-xl ${
                       element.character_name === userCharacter 
                         ? 'text-green-400' 
                         : 'text-blue-400'
@@ -248,7 +452,7 @@ export default function RehearsePage() {
                       {element.character_name}
                     </span>
                     {element.parenthetical && (
-                      <span className="text-gray-400 text-sm ml-2">
+                      <span className="text-gray-400 text-sm block mt-1">
                         ({element.parenthetical})
                       </span>
                     )}
@@ -256,12 +460,12 @@ export default function RehearsePage() {
                 )}
 
                 {element.element_type === 'dialogue' && (
-                  <div className={`pl-8 ${
+                  <div className={`pl-4 border-l-4 ${
                     element.character_name === userCharacter 
-                      ? 'text-green-300' 
-                      : 'text-white'
-                  }`}>
-                    <p className="text-xl leading-relaxed">{element.dialogue}</p>
+                      ? 'border-green-500 text-green-100' 
+                      : 'border-blue-500 text-white'
+                  } ${isCurrent ? 'text-2xl' : 'text-lg'}`}>
+                    <p className="leading-relaxed">{element.dialogue}</p>
                   </div>
                 )}
               </div>
@@ -270,59 +474,100 @@ export default function RehearsePage() {
         </div>
 
         {/* Controls sidebar */}
-        <div className="w-64 bg-gray-800 border-l border-gray-700 p-4 flex flex-col">
-          {/* Current line indicator */}
+        <div className="w-72 bg-gray-800 border-l border-gray-700 p-4 flex flex-col">
+          {/* Status indicator */}
           <div className="mb-6">
-            <h3 className="text-sm font-medium text-gray-400 mb-2">Current Line</h3>
-            <div className={`p-3 rounded-lg ${
-              isUserLine ? 'bg-green-600/20 border border-green-500' : 'bg-blue-600/20 border border-blue-500'
+            <h3 className="text-sm font-medium text-gray-400 mb-3">Status</h3>
+            
+            {/* Connection */}
+            <div className={`p-3 rounded-lg mb-2 ${
+              connectionState === 'active' ? 'bg-green-600/20 border border-green-500' :
+              connectionState === 'connecting' ? 'bg-yellow-600/20 border border-yellow-500' :
+              'bg-red-600/20 border border-red-500'
             }`}>
-              <p className="text-sm text-gray-300">
-                {isUserLine ? 'YOUR TURN' : 'AI SPEAKING'}
+              <p className="text-sm">
+                {connectionState === 'active' ? '🟢 Connected' :
+                 connectionState === 'connecting' ? '🟡 Connecting...' :
+                 '🔴 Disconnected'}
               </p>
-              <p className="font-semibold">
-                {currentElement?.character_name || 'Stage Direction'}
+            </div>
+
+            {/* Who's speaking */}
+            <div className={`p-3 rounded-lg ${
+              isUserSpeaking ? 'bg-green-600/20 border border-green-500' :
+              isAISpeaking ? 'bg-blue-600/20 border border-blue-500' :
+              'bg-gray-700'
+            }`}>
+              <p className="text-sm font-medium">
+                {isUserSpeaking ? '🎤 You Speaking' :
+                 isAISpeaking ? '🔊 AI Speaking' :
+                 isPaused ? '⏸ Paused' :
+                 '⏳ Waiting...'}
               </p>
+              
+              {/* Silence progress bar */}
+              {!isUserSpeaking && !isAISpeaking && !isPaused && silenceTimer > 0 && (
+                <div className="mt-2">
+                  <div className="text-xs text-gray-400 mb-1">
+                    Advancing in {Math.max(0, Math.ceil((SILENCE_THRESHOLD - silenceTimer) / 1000))}s
+                  </div>
+                  <div className="w-full bg-gray-600 rounded-full h-1.5">
+                    <div 
+                      className="bg-blue-500 h-1.5 rounded-full transition-all"
+                      style={{ width: `${Math.min(100, (silenceTimer / SILENCE_THRESHOLD) * 100)}%` }}
+                    ></div>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 
-          {/* Control buttons */}
+          {/* Dramatic Pause Button */}
+          {showDramaticPauseButton && (
+            <button
+              onClick={handleDramaticPause}
+              className="w-full mb-4 px-4 py-3 bg-purple-600 hover:bg-purple-500 rounded-lg font-medium animate-pulse"
+            >
+              🎭 Keep Pausing
+            </button>
+          )}
+
+          {/* Manual controls */}
           <div className="space-y-3">
             <button
               onClick={goBack}
               disabled={currentIndex === 0}
-              className="w-full px-4 py-3 bg-gray-700 hover:bg-gray-600 disabled:opacity-30 rounded-lg font-medium transition-colors"
+              className="w-full px-4 py-2 bg-gray-700 hover:bg-gray-600 disabled:opacity-30 rounded-lg text-sm"
             >
-              ← Previous Line
+              ← Go Back
             </button>
 
             <button
-              onClick={advanceLine}
-              className="w-full px-4 py-4 bg-blue-600 hover:bg-blue-500 rounded-lg font-semibold text-lg transition-colors"
+              onClick={forceAdvance}
+              className="w-full px-4 py-3 bg-blue-600 hover:bg-blue-500 rounded-lg font-semibold"
             >
               Next Line →
             </button>
 
-            <div className="pt-4 border-t border-gray-700">
-              <button
-                onClick={() => setIsPaused(!isPaused)}
-                className={`w-full px-4 py-3 rounded-lg font-medium transition-colors ${
-                  isPaused ? 'bg-yellow-600 hover:bg-yellow-500' : 'bg-gray-700 hover:bg-gray-600'
-                }`}
-              >
-                {isPaused ? '▶ Resume' : '⏸ Pause'}
-              </button>
-            </div>
+            <button
+              onClick={togglePause}
+              className={`w-full px-4 py-2 rounded-lg font-medium ${
+                isPaused ? 'bg-yellow-600 hover:bg-yellow-500' : 'bg-gray-700 hover:bg-gray-600'
+              }`}
+            >
+              {isPaused ? '▶ Resume' : '⏸ Pause'}
+            </button>
+          </div>
 
-            {currentElement?.character_name && currentElement.character_name !== userCharacter && (
-              <button
-                onClick={playCurrentLine}
-                disabled={isPlaying}
-                className="w-full px-4 py-3 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 rounded-lg font-medium transition-colors"
-              >
-                {isPlaying ? '🔊 Playing...' : '🔊 Replay Line'}
-              </button>
-            )}
+          {/* Current line preview */}
+          <div className="mt-6 p-3 bg-gray-700 rounded-lg">
+            <p className="text-xs text-gray-400 mb-1">Current:</p>
+            <p className="font-medium text-sm">
+              {isUserLine ? '🟢 Your Line' : '🔊 AI Line'}
+            </p>
+            <p className="text-gray-300 text-sm mt-1 line-clamp-3">
+              {currentElement?.dialogue || currentElement?.content}
+            </p>
           </div>
 
           {/* Progress */}
@@ -338,12 +583,13 @@ export default function RehearsePage() {
             </div>
           </div>
 
-          {/* Keyboard shortcuts */}
+          {/* Instructions */}
           <div className="mt-6 text-xs text-gray-500">
-            <p className="font-medium mb-2">Shortcuts:</p>
-            <p>Space: Next line</p>
-            <p>← →: Navigate</p>
-            <p>P: Pause/Resume</p>
+            <p className="font-medium mb-1">How it works:</p>
+            <p>• Speak naturally</p>
+            <p>• Pause up to 1.5s between lines</p>
+            <p>• Tap "Keep Pausing" for dramatic effect</p>
+            <p>• AI responds automatically</p>
           </div>
         </div>
       </div>
