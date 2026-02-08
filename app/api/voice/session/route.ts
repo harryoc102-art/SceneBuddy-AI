@@ -27,7 +27,13 @@ export async function POST(req: NextRequest) {
       body: JSON.stringify({
         model: 'gpt-4o-realtime-preview-2024-12-17',
         voice: 'alloy',
-        instructions: `You are an AI scene partner for an actor rehearsing a script. You voice characters other than ${userCharacter}. Speak naturally with appropriate emotion and pacing. Wait for the actor to finish speaking before responding.`,
+        instructions: `You are an AI scene partner for an actor rehearsing a script. You voice characters other than ${userCharacter}. 
+
+CRITICAL: You must read the EXACT lines from the script. NO improvisation. NO ad-libbing. NO changing words. Read the script word-for-word.
+
+If the user goes off-script, do NOT improvise with them. Stay silent or gently redirect them back to the script.
+
+Speak naturally with appropriate emotion, but use the EXACT words provided.`,
         input_audio_transcription: {
           model: 'whisper-1'
         },

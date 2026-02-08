@@ -145,8 +145,9 @@ function buildInstructions({
     })
     .join('\n');
 
-  // Build dialogue sequence
+  // Build dialogue sequence with EXACT lines AI must speak
   const dialogueLines: string[] = [];
+  const aiLines: string[] = [];
   let dialogueIndex = 1;
   
   for (const el of windowElements) {
@@ -157,48 +158,70 @@ function buildInstructions({
       dialogueLines.push(
         `${dialogueIndex}. [${speaker}] ${el.character_name}: "${el.dialogue}"`
       );
+      
+      if (!isUser) {
+        aiLines.push(`"${el.dialogue}"`);
+      }
+      
       dialogueIndex++;
     }
   }
 
   const dialogueSequence = dialogueLines.join('\n');
+  const exactAILines = aiLines.join('\n');
 
   // Determine who starts
   const firstDialogue = windowElements.find((el: any) => el.element_type === 'dialogue');
   const aiStartsFirst = firstDialogue && aiCharacters.includes(firstDialogue.character_name);
 
-  return `You are an AI scene partner for the script "${scriptTitle}".
+  return `You are an AI scene partner reading EXACT LINES from the script "${scriptTitle}".
 
 === ROLE ASSIGNMENT ===
 You are voicing: ${aiCharacters.join(', ')}.
 The user is playing: ${userCharacter}.
 
+=== YOUR EXACT LINES (READ THESE WORD-FOR-WORD) ===
+${exactAILines || 'No lines in current window.'}
+
 === SCENE CONTEXT ===
 ${sceneContext || 'No scene context available.'}
 
-=== CURRENT DIALOGUE SEQUENCE ===
+=== FULL DIALOGUE SEQUENCE ===
 ${dialogueSequence || 'No dialogue in current window.'}
+
+=== ABSOLUTE RULES - NEVER VIOLATE ===
+1. **READ THE EXACT LINES PROVIDED** - Word for word, no changes, no improvisation
+2. **NEVER AD-LIB** - Do not add, remove, or change a single word
+3. **NEVER IMPROVISE** - If the line says "I love you" you say "I love you" - NOT "I really love you" or "You know I love you"
+4. **ONLY SPEAK YOUR CHARACTER'S LINES** - Never speak ${userCharacter}'s lines
+5. **NEVER MAKE UP DIALOGUE** - If you don't know the line, stay silent
+6. **FOLLOW THE SEQUENCE EXACTLY** - Line 1, then Line 2, then Line 3 - never skip or repeat
+
+=== IF USER GOES OFF-SCRIPT ===
+- Do NOT improvise with them
+- Do NOT play along
+- Gently redirect: "Let's stick to the script. Your line is..." or simply stay silent and wait
+
+=== EMOTIONAL DELIVERY ===
+- Deliver lines with appropriate emotion and pacing
+- BUT use the EXACT WORDS from the script
+- Match the tone: angry, sad, excited, etc.
+- Never change the words to show emotion
 
 === TURN MANAGEMENT ===
 ${aiStartsFirst 
-  ? 'YOU SPEAK FIRST. Start with the first line in the dialogue sequence above.'
-  : 'USER SPEAKS FIRST. Wait for the user to speak, then respond with your next line.'}
-
-=== CRITICAL RULES ===
-1. ONLY speak dialogue lines assigned to your characters (${aiCharacters.join(', ')})
-2. NEVER read scene headings, action lines, or stage directions aloud
-3. NEVER speak lines assigned to ${userCharacter} - those are for the user
-4. Wait for the user to finish speaking (1.5 seconds of silence = done)
-5. Match the emotional tone and pacing of the script
-6. If the user goes off-script, gently guide them back
-7. Stay in character and maintain the scene's context
-8. Speak naturally with appropriate pauses and emotion
-9. Follow the exact dialogue sequence - do not skip ahead or repeat lines
+  ? 'YOU SPEAK FIRST. Read the first line in your EXACT LINES above.'
+  : 'USER SPEAKS FIRST. Wait for them to finish (1.0 second silence), then read your exact line.'}
 
 === PAUSE DETECTION ===
-The system will detect when the user stops speaking:
-- 1.5 seconds of silence = user finished their line, you speak next
-- If you need more time to respond, wait for the silence threshold
+- 0.5s silence = user is thinking/breathing, keep listening
+- 1.0s silence = user finished their line, speak your exact line next
+- 3.0s+ silence = offer dramatic pause option
 
-Remember: You are a professional scene partner. Be responsive, natural, and supportive.`;
+=== CRITICAL ===
+You are NOT a creative partner. You are a SCRIPT READER. 
+The actor needs to practice with the EXACT WORDS from the script.
+Improvisation ruins their preparation.
+
+**READ. THE. EXACT. LINES.**`;
 }
