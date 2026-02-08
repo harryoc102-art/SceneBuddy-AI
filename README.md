@@ -1,36 +1,57 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# SceneBuddy AI
 
-## Getting Started
+An AI-powered scene partner for actors. Upload any script, choose your character, and rehearse with responsive AI voices at your own pace.
 
-First, run the development server:
+## Features
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+- **📄 Direct PDF Parsing** - No external dependencies, scripts parse instantly
+- **🎭 Character Selection** - Choose who you want to play
+- **🔊 AI Voice Partners** - Natural voices using ElevenLabs API
+- **📜 Live Teleprompter** - See your script with current line highlighted
+- **⏯️ Manual Turn Control** - Press spacebar to advance, never feel rushed
+- **🎬 Dramatic Pauses** - Take your time, control the pacing
+
+## Tech Stack
+
+- Next.js 14 + TypeScript
+- Tailwind CSS
+- Clerk Authentication
+- Vercel Postgres
+- ElevenLabs API for voices
+- Direct PDF parsing (no N8N!)
+
+## Setup
+
+1. Clone the repo
+2. Install dependencies: `npm install`
+3. Copy `.env.local.example` to `.env.local` and fill in your API keys:
+   - Clerk (authentication)
+   - Vercel Postgres (database)
+   - ElevenLabs (voices)
+4. Set up database: `npm run db:setup`
+5. Run dev server: `npm run dev`
+
+## Environment Variables
+
+```
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=
+CLERK_SECRET_KEY=
+POSTGRES_URL=
+ELEVENLABS_API_KEY=
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Usage
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+1. **Upload Script** - Upload any PDF screenplay
+2. **Setup** - Choose your character and assign voices to AI partners
+3. **Rehearse** - Use spacebar to advance lines, see script on screen, hear AI voices
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Keyboard Shortcuts
 
-## Learn More
+- `Space` - Advance to next line
+- `←` / `→` - Navigate lines
+- `P` - Pause/Resume
 
-To learn more about Next.js, take a look at the following resources:
+## License
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+MIT
